@@ -65,4 +65,4 @@ We welcome contributions! Each repo has its own guidelines, but generally:
 
 ---
 
-<p align="center">Made with 🧡 in Delaware</p>
+<p align="center">Made with 🧡 by a global team</p>
