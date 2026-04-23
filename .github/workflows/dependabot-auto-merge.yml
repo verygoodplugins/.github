@@ -1,0 +1,55 @@
+name: Dependabot auto-merge (reusable)
+
+# Reusable workflow — call from any repo with:
+#
+#   on:
+#     pull_request_target:
+#       types: [opened, reopened, synchronize, ready_for_review]
+#   jobs:
+#     auto-merge:
+#       uses: verygoodplugins/.github/.github/workflows/dependabot-auto-merge.yml@main
+#       secrets: inherit
+#
+# Auto-merges Dependabot PRs that match ANY of these:
+#   - patch update (any dep type)
+#   - minor update to dev/test dependencies
+#   - minor or patch update to GitHub Actions
+#   - indirect/transitive dependency (any version bump)
+#   - security advisory fix (any version bump)
+#
+# Major updates to direct runtime deps always require manual review.
+
+on:
+  workflow_call:
+    secrets:
+      GH_TOKEN:
+        required: false  # falls back to GITHUB_TOKEN if not provided
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-approve and merge
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.dependency-type == 'indirect' ||
+          (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
+           steps.meta.outputs.dependency-type == 'direct:development') ||
+          (steps.meta.outputs.package-ecosystem == 'github_actions')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr review --approve "$PR_URL" 2>/dev/null || true
+          gh pr merge --auto --squash "$PR_URL"
