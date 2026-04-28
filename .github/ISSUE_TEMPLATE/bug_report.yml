@@ -1,0 +1,39 @@
+name: 🐛 Bug report
+description: Something's broken
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, what did you get?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Plugin version, package version, or commit SHA
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        OS:
+        Node / PHP / Python version:
+        Browser (if relevant):
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      render: shell
