@@ -5,12 +5,16 @@ name: Dependabot auto-merge (reusable)
 #   on:
 #     pull_request_target:
 #       types: [opened, reopened, synchronize, ready_for_review]
+#     workflow_run:
+#       workflows: ["CI"]
+#       types: [completed]
 #   jobs:
 #     auto-merge:
 #       uses: verygoodplugins/.github/.github/workflows/dependabot-auto-merge.yml@main
 #       secrets: inherit
 #
-# Auto-merges Dependabot PRs that are not semver-major updates.
+# Auto-merges Dependabot PRs that are not semver-major updates. Merge-queue
+# branches are retried after CI and are enqueued without forcing a merge method.
 #
 # Major updates always require manual review.
 
@@ -18,7 +22,7 @@ on:
   workflow_call:
     secrets:
       GH_TOKEN:
-        required: false  # falls back to GITHUB_TOKEN if not provided
+        required: false  # falls back to github.token if not provided
 
 permissions:
   contents: write
@@ -29,26 +33,77 @@ jobs:
   auto-merge:
     if: >-
       ${{
-        github.event.pull_request.user.login == 'dependabot[bot]' &&
-        !github.event.pull_request.draft
+        (
+          github.event_name == 'pull_request_target' &&
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          !github.event.pull_request.draft
+        ) ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.event == 'pull_request' &&
+          github.event.workflow_run.conclusion == 'success'
+        )
       }}
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch Dependabot metadata
-        id: meta
-        uses: dependabot/fetch-metadata@v2
+      - name: Resolve Dependabot PR
+        id: pr
+        uses: actions/github-script@v9
         with:
-          github-token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN || github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            let pull_number = context.payload.pull_request?.number;
+
+            if (!pull_number) {
+              const pullRequests = context.payload.workflow_run?.pull_requests ?? [];
+              pull_number = pullRequests[0]?.number;
+            }
+
+            if (!pull_number) {
+              core.setOutput('skip', 'true');
+              core.setOutput('reason', 'No pull request is associated with this event.');
+              return;
+            }
+
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number,
+            });
+
+            const labels = pull.labels.map((label) => label.name);
+            const isDependabot = pull.user?.login === 'dependabot[bot]';
+            if (!isDependabot || pull.draft || pull.base.ref !== context.payload.repository.default_branch) {
+              core.setOutput('skip', 'true');
+              core.setOutput('reason', 'Pull request is not a ready Dependabot PR against the default branch.');
+              return;
+            }
+
+            core.setOutput('skip', 'false');
+            core.setOutput('number', String(pull.number));
+            core.setOutput('url', pull.html_url);
+            core.setOutput('head_sha', pull.head.sha);
+            core.setOutput('has_automerge_label', String(labels.includes('automerge')));
+            core.setOutput('has_needs_human_review_label', String(labels.includes('needs-human-review')));
+
+      - name: Fetch Dependabot metadata
+        if: ${{ steps.pr.outputs.skip != 'true' && github.event_name == 'pull_request_target' }}
+        id: meta
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GH_TOKEN || github.token }}
 
       - name: Label Dependabot PR
+        if: ${{ steps.pr.outputs.skip != 'true' && github.event_name == 'pull_request_target' }}
         uses: actions/github-script@v9
         env:
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         with:
-          github-token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN || github.token }}
           script: |
             const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
+            const issue_number = Number('${{ steps.pr.outputs.number }}');
             const labels = [
               { name: 'dependencies', color: '0366d6', description: 'Dependency update' },
               process.env.UPDATE_TYPE === 'version-update:semver-major'
@@ -77,16 +132,68 @@ jobs:
             });
 
       - name: Auto-approve and merge non-major updates
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        if: >-
+          ${{
+            steps.pr.outputs.skip != 'true' &&
+            (
+              (
+                github.event_name == 'pull_request_target' &&
+                steps.meta.outputs.update-type != 'version-update:semver-major'
+              ) ||
+              (
+                github.event_name == 'workflow_run' &&
+                steps.pr.outputs.has_automerge_label == 'true' &&
+                steps.pr.outputs.has_needs_human_review_label != 'true'
+              )
+            )
+          }}
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          pr_state="$(
+            gh api graphql \
+              -f owner="$owner" \
+              -f repo="$repo" \
+              -F number="$PR_NUMBER" \
+              -f query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){isMergeQueueEnabled isInMergeQueue}}}' \
+              --jq '.data.repository.pullRequest'
+          )"
+          queue_enabled="$(jq -r '.isMergeQueueEnabled' <<<"$pr_state")"
+          in_queue="$(jq -r '.isInMergeQueue' <<<"$pr_state")"
+
+          if [ "$in_queue" = "true" ]; then
+            echo "Pull request is already in the merge queue."
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request_target" ] && [ "$queue_enabled" = "true" ]; then
+            echo "Merge queue is enabled; deferring enqueue until CI completes."
+            exit 0
+          fi
+
           gh pr review --approve "$PR_URL" 2>/dev/null || true
-          gh pr merge --auto --squash "$PR_URL"
+
+          if [ "$queue_enabled" = "true" ]; then
+            gh pr merge --auto --match-head-commit "$HEAD_SHA" "$PR_URL"
+          else
+            gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
+          fi
 
       - name: Leave major updates for review
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        if: >-
+          ${{
+            steps.pr.outputs.skip != 'true' &&
+            github.event_name == 'pull_request_target' &&
+            steps.meta.outputs.update-type == 'version-update:semver-major'
+          }}
         env:
           DEPENDENCIES: ${{ steps.meta.outputs.dependency-names }}
         run: |
