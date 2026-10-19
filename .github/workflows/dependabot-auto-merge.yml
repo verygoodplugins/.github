@@ -159,7 +159,7 @@ jobs:
         if: steps.app-token.outcome == 'failure'
         run: |
           set -euo pipefail
-          message="Could not mint a GitHub App token; falling back to GH_TOKEN/github.token. Auto-merge still works, but the merge commit will not trigger push-triggered workflows (CI, Release Please, security scans). Set AUTOMERGE_APP_CLIENT_ID and AUTOMERGE_APP_PRIVATE_KEY and forward them with 'secrets: inherit'."
+          message="Could not mint a GitHub App token; falling back to GH_TOKEN/github.token. Auto-merge still works, but the merge commit will not trigger push-triggered workflows (CI, Release Please, security scans). Set AUTOMERGE_APP_CLIENT_ID and AUTOMERGE_APP_PRIVATE_KEY, and forward them from the calling stub alongside GH_TOKEN in its 'secrets:' mapping."
           echo "::warning title=Dependabot auto-merge running degraded::${message}"
           {
             echo "### Dependabot auto-merge is running degraded"
@@ -363,6 +363,18 @@ jobs:
       # auto-merged, where a `!= major` test would have merged it. Majors stay manual
       # because they are the ones that break builds; for a grouped PR the update type
       # is the highest bump in the group, so a group containing a major is not armed.
+      #
+      # The `workflow_run` pass is the one path that cannot call `fetch-metadata`, so it
+      # has to read the classification the `pull_request_target` pass recorded as
+      # labels. Labels are mutable and not bound to a commit, so they are trusted only
+      # once they are known to describe *this* head: the newest `automerge` or
+      # `needs-human-review` labelling must be at least as recent as the head commit.
+      # Without that, a head that changed from a patch bump to a major could be merged
+      # off the previous head's `automerge` label whenever CI finished before
+      # classification had relabelled — the event-scoped concurrency groups stop the two
+      # runs cancelling each other, but they do not order the label write before the
+      # read. Waiting rather than refusing keeps the merge-queue path live, since no
+      # further `workflow_run` event would arrive to retry after classification lands.
       - name: Decide whether this head is auto-mergeable
         id: gate
         if: steps.pr.outputs.skip != 'true'
@@ -370,12 +382,18 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DEPENDABOT_ONLY: ${{ steps.provenance.outputs.dependabot-only }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
-          HAS_AUTOMERGE: ${{ steps.pr.outputs.has_automerge_label }}
-          HAS_NEEDS_HUMAN_REVIEW: ${{ steps.pr.outputs.has_needs_human_review_label }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           eligible=false
           reason=""
+
+          classified_at() {
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/timeline" --paginate \
+              --jq '[.[] | select(.event == "labeled" and (.label.name == "automerge" or .label.name == "needs-human-review"))] | last | .created_at // ""'
+          }
 
           if [ "${DEPENDABOT_ONLY}" != "true" ]; then
             reason="the head carries commits that are not Dependabot's"
@@ -386,10 +404,26 @@ jobs:
               "") reason="Dependabot reported no update type for this bump" ;;
               *) reason="update type ${UPDATE_TYPE} is neither patch nor minor" ;;
             esac
-          elif [ "${HAS_AUTOMERGE}" = "true" ] && [ "${HAS_NEEDS_HUMAN_REVIEW}" != "true" ]; then
-            eligible=true
           else
-            reason="the PR is not labelled automerge, or is labelled needs-human-review"
+            head_at="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}" --jq '.commit.committer.date')"
+            head_epoch="$(date -u -d "${head_at}" +%s)"
+            reason="classification has not labelled this head (${HEAD_SHA}) yet"
+
+            for attempt in $(seq 1 12); do
+              label_at="$(classified_at)"
+              if [ -n "${label_at}" ] && [ "$(date -u -d "${label_at}" +%s)" -ge "${head_epoch}" ]; then
+                labels=",$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" --jq '[.[].name] | join(",")'),"
+                echo "Head committed ${head_at}; classified ${label_at}; labels ${labels}"
+                case "${labels}" in
+                  *,needs-human-review,*) reason="the PR is labelled needs-human-review" ;;
+                  *,automerge,*) eligible=true ;;
+                  *) reason="neither eligibility label is present" ;;
+                esac
+                break
+              fi
+              echo "Head committed ${head_at}; newest classification ${label_at:-none} — waiting (attempt ${attempt}/12)"
+              sleep 5
+            done
           fi
 
           echo "eligible=${eligible}" >> "$GITHUB_OUTPUT"
