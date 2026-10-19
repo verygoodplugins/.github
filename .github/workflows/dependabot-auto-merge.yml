@@ -105,6 +105,43 @@ jobs:
       group: dependabot-auto-merge-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
       cancel-in-progress: true
     steps:
+      # Disarm before reclassifying, not after. GitHub keeps auto-merge armed when the
+      # pusher has write access — its docs say it is disabled automatically only for
+      # pushes by users *without* write permission — so from the moment a human commit
+      # (or a rebase into a major) lands until this job reaches its cancel step, the
+      # previous head's arm is still live. If the new head's required checks go green
+      # inside that window, GitHub merges it before this run has classified anything.
+      #
+      # Revoking first and re-arming only once the gate passes inverts the window: a PR
+      # is briefly not armed when it should be, which only delays a merge, instead of
+      # briefly armed when it should not be. The cost is an extra pair of timeline
+      # entries per `synchronize`, and a merge that lands a few seconds later.
+      #
+      # The first step in the job, and deliberately not dependent on the App token: it
+      # reads the PR straight from the event payload and authenticates with GH_TOKEN /
+      # github.token, both available with no network round trip. Minting an App token
+      # takes network calls of its own, and the stale arm stays live for their duration,
+      # so this cannot wait behind it. Disarming does not need the App token anyway —
+      # only arming does, because only the merge has to trigger downstream workflows.
+      #
+      # Failing here is not fatal: the job continues and the cancel step at the end
+      # re-attempts the disarm under `!cancelled()`. `pull_request_target` only — a
+      # `workflow_run` completion carries no head change to reclassify.
+      - name: Disarm auto-merge before reclassifying this head
+        if: github.event_name == 'pull_request_target'
+        continue-on-error: true
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')" = "true" ]; then
+            echo "Auto-merge is armed from an earlier classification; disarming before re-evaluating this head."
+            gh pr merge --disable-auto "$PR_URL"
+          else
+            echo "Auto-merge is not armed; nothing to disarm."
+          fi
+
       # GitHub does not start new workflow runs from events caused by GITHUB_TOKEN,
       # and that extends to the merge an auto-merge it armed performs. Measured on
       # verygoodplugins/mcp-automem: the three auto-merged bumps 5775c95, 07db972 and
@@ -167,38 +204,6 @@ jobs:
             echo
             echo "${message}"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # Disarm before reclassifying, not after. GitHub keeps auto-merge armed when the
-      # pusher has write access — its docs say it is disabled automatically only for
-      # pushes by users *without* write permission — so from the moment a human commit
-      # (or a rebase into a major) lands until this job reaches its cancel step, the
-      # previous head's arm is still live. If the new head's required checks go green
-      # inside that window, GitHub merges it before this run has classified anything.
-      #
-      # Revoking first and re-arming only once the gate passes inverts the window: a PR
-      # is briefly not armed when it should be, which only delays a merge, instead of
-      # briefly armed when it should not be. The cost is an extra pair of timeline
-      # entries per `synchronize`, and a merge that lands a few seconds later.
-      #
-      # Reads the PR straight from the event payload rather than the resolved outputs, so
-      # it runs before anything that could fail and leave the stale arm in place. Failing
-      # here is not fatal: the job continues and the cancel step at the end re-attempts
-      # the disarm under `!cancelled()`. `pull_request_target` only — a `workflow_run`
-      # completion carries no head change to reclassify.
-      - name: Disarm auto-merge before reclassifying this head
-        if: github.event_name == 'pull_request_target'
-        continue-on-error: true
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
-        run: |
-          set -euo pipefail
-          if [ "$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')" = "true" ]; then
-            echo "Auto-merge is armed from an earlier classification; disarming before re-evaluating this head."
-            gh pr merge --disable-auto "$PR_URL"
-          else
-            echo "Auto-merge is not armed; nothing to disarm."
-          fi
 
       - name: Resolve Dependabot PR
         id: pr
