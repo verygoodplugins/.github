@@ -151,8 +151,10 @@ jobs:
       #   d2a2660, 06f6fb1            merged by a human                4 push runs
       #
       # So auto-merged bumps silently skipped the release PR update, the push-to-main
-      # CI run that is the only thing testing bumps in combination, and the scheduled
-      # security scans. 7b45e959 is the proof the fix works: an auto-merge armed by the
+      # CI run that is the only thing testing bumps in combination, and the
+      # push-triggered security scan — not the weekly one, which runs off an
+      # independent `schedule` trigger and was never affected. 7b45e959 is the proof
+      # the fix works: an auto-merge armed by the
       # App, merged by `vgp-dependabot-auto-merge[bot]`, where identical GITHUB_TOKEN
       # auto-merges had produced nothing.
       #
@@ -209,7 +211,7 @@ jobs:
         if: steps.app-token.outcome == 'failure'
         run: |
           set -euo pipefail
-          message="Could not mint a GitHub App token; falling back to GH_TOKEN/github.token. Auto-merge still works, but the merge commit will not trigger push-triggered workflows (CI, Release Please, security scans). Set AUTOMERGE_APP_CLIENT_ID and AUTOMERGE_APP_PRIVATE_KEY, and forward them from the calling stub alongside GH_TOKEN in its 'secrets:' mapping."
+          message="Could not mint a GitHub App token; falling back to GH_TOKEN/github.token. Auto-merge still works, but the merge commit will not trigger push-triggered workflows (CI, Release Please, the push-triggered security scan). Set AUTOMERGE_APP_CLIENT_ID and AUTOMERGE_APP_PRIVATE_KEY, and forward them from the calling stub alongside GH_TOKEN in its 'secrets:' mapping."
           echo "::warning title=Dependabot auto-merge running degraded::${message}"
           {
             echo "### Dependabot auto-merge is running degraded"
