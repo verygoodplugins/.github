@@ -122,9 +122,13 @@ jobs:
       # the minted token to what this job actually does, independently of whatever the
       # App itself is granted — but the App must be granted at least as much, because
       # requesting a permission the installation lacks fails the mint outright. The
-      # App therefore needs Contents RW, Pull requests RW, Issues RW, Workflows RW and
-      # Metadata R. Workflows is for the `github-actions` ecosystem: without it, a
-      # bump touching `.github/workflows/` cannot be merged.
+      # App therefore needs Contents RW, Pull requests RW, Issues RW, Workflows RW,
+      # Merge queues RW and Metadata R. Workflows is for the `github-actions`
+      # ecosystem: without it, a bump touching `.github/workflows/` cannot be merged.
+      # Merge queues is for the enqueue path below: no consumer has a queue enabled
+      # today, but granting it up front means turning one on is a ruleset change rather
+      # than a token change, and without it the enqueue fails outright rather than
+      # degrading, because by then the mint has already succeeded.
       - name: Mint a GitHub App installation token
         id: app-token
         # Degrade, do not break. A repo whose stub forwards no App secrets, or that
@@ -140,6 +144,7 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
           permission-workflows: write
+          permission-merge-queues: write
 
       # `outcome`, not `conclusion`: `continue-on-error` rewrites the conclusion to
       # success, and only the outcome still records that the step failed.
