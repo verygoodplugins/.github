@@ -11,14 +11,21 @@ name: Dependabot auto-merge (reusable)
 #   jobs:
 #     auto-merge:
 #       uses: verygoodplugins/.github/.github/workflows/dependabot-auto-merge.yml@main
-#       secrets: inherit
+#       secrets:
+#         GH_TOKEN: ${{ secrets.GH_TOKEN }}
+#         AUTOMERGE_APP_CLIENT_ID: ${{ secrets.AUTOMERGE_APP_CLIENT_ID }}
+#         AUTOMERGE_APP_PRIVATE_KEY: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
 #
 # Two things about that stub are load-bearing:
 #
-# `secrets: inherit` is required, not stylistic. A called workflow only receives the
-# secrets its caller forwards, so a stub that passes `secrets: { GH_TOKEN: ... }`
-# explicitly cannot hand over the App-token secrets below. It still runs — degraded,
-# on `github.token`, with the downstream-trigger bug this workflow exists to fix.
+# All three secrets have to be forwarded. A called workflow only receives the secrets
+# its caller passes, so a stub mapping `GH_TOKEN` alone cannot hand over the App-token
+# secrets below. It still runs — degraded, on `github.token`, with the
+# downstream-trigger bug this workflow exists to fix. Forward them explicitly rather
+# than with `secrets: inherit`: inherit would also work, but it passes every
+# caller-accessible secret — npm and registry tokens, deployment credentials — to this
+# workflow, which consumers track at a mutable `@main`. A secret a repo has not set
+# forwards as empty, which is the degrade path the mint step below handles.
 #
 # Do not narrow `permissions:` in the calling job. A called workflow's permissions
 # must be equal to or more restrictive than its caller's, and exceeding them is a
