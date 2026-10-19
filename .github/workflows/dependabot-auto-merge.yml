@@ -13,20 +13,44 @@ name: Dependabot auto-merge (reusable)
 #       uses: verygoodplugins/.github/.github/workflows/dependabot-auto-merge.yml@main
 #       secrets: inherit
 #
-# Auto-merges Dependabot PRs that are not semver-major updates. Merge-queue
-# branches are retried after CI and are enqueued without forcing a merge method.
+# Two things about that stub are load-bearing:
 #
-# Major updates always require manual review.
+# `secrets: inherit` is required, not stylistic. A called workflow only receives the
+# secrets its caller forwards, so a stub that passes `secrets: { GH_TOKEN: ... }`
+# explicitly cannot hand over the App-token secrets below. It still runs — degraded,
+# on `github.token`, with the downstream-trigger bug this workflow exists to fix.
+#
+# Do not narrow `permissions:` in the calling job. A called workflow's permissions
+# must be equal to or more restrictive than its caller's, and exceeding them is a
+# startup failure before any step runs — which is why this workflow asks only for
+# `contents` and `pull-requests` and mints its own token for everything else.
+#
+# Auto-merges Dependabot PRs for semver-patch and semver-minor bumps, once every
+# commit on the PR head is Dependabot's. Merge-queue branches are retried after CI
+# and are enqueued without forcing a merge method. Majors always require review.
 
 on:
   workflow_call:
     secrets:
       GH_TOKEN:
-        required: false  # falls back to github.token if not provided
+        required: false # falls back to github.token if not provided
+      # The GitHub App that mints the merge token. Optional so a repo that has not
+      # been set up yet keeps auto-merging (degraded) instead of breaking, but every
+      # repo should set them — see "Mint a GitHub App installation token" below.
+      AUTOMERGE_APP_CLIENT_ID:
+        required: false
+      AUTOMERGE_APP_PRIVATE_KEY:
+        required: false
 
+# Deliberately narrower than the work this workflow does. Labelling writes through
+# the issues API, which would normally mean `issues: write` here — but that broke
+# every caller whose stub granted only `contents` + `pull-requests`, as a callee
+# cannot hold a permission its caller lacks. Those repos failed at startup on every
+# Dependabot PR for months while the permissive ones worked. The minted App token
+# below is not GITHUB_TOKEN and is not bounded by the caller's grants, so labelling
+# rides on that instead and this block stays inside what every stub already allows.
 permissions:
   contents: write
-  issues: write
   pull-requests: write
 
 jobs:
@@ -48,12 +72,85 @@ jobs:
         )
       }}
     runs-on: ubuntu-latest
+    # One run at a time per PR, newest wins. Without this, two overlapping
+    # `synchronize` runs can interleave: the older one validates a Dependabot-only
+    # head, the newer one cancels auto-merge after a human push, and then the older
+    # one re-arms against the head it never saw. A cancelled run stops at the
+    # `!cancelled()` guard on the cancel step, so the surviving newest run is the
+    # only one that acts — which is why every path below re-derives eligibility from
+    # scratch rather than trusting work an earlier run may have done.
+    #
+    # `workflow_run` payloads carry no `pull_request` object, and their
+    # `pull_requests` array is often empty, so the group falls through to `run_id`
+    # and simply does not dedupe rather than lumping unrelated runs together.
+    concurrency:
+      # Kept on one line on purpose: a folded block scalar preserves the newlines of
+      # more-indented continuation lines, which would leave them inside the `${{ }}`.
+      group: dependabot-auto-merge-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
+      cancel-in-progress: true
     steps:
+      # GitHub does not start new workflow runs from events caused by GITHUB_TOKEN,
+      # and that extends to the merge an auto-merge it armed performs. Measured on
+      # verygoodplugins/mcp-automem: the three auto-merged bumps 5775c95, 07db972 and
+      # 9ed9084 each produced 0 runs for `event=push`, while the human merges on
+      # either side (d2a2660, 06f6fb1) each produced 4 — CI, Release Please, Docs
+      # Dispatch and Security. So auto-merged bumps silently skipped the release PR
+      # update, the push-to-main CI run that is the only thing testing bumps in
+      # combination, and the scheduled security scans:
+      #
+      #   gh api "repos/OWNER/REPO/actions/runs?head_sha=SHA&event=push" --jq '.total_count'
+      #
+      # Filter on `event=push`. A bare total is misleading: 5775c95 reports 2 runs,
+      # both Dependabot's own `event=dynamic` runs attached to main's head.
+      #
+      # A GitHub App installation token is not GITHUB_TOKEN, so merges it performs do
+      # start those runs. The same swap is what a merge queue would need —
+      # GITHUB_TOKEN cannot add a pull request to one either.
+      #
+      # Pinned to an exact version rather than the `v3` major, so a new release cannot
+      # change what runs here without a commit. `client-id` is used because `app-id`
+      # is deprecated in v3 and warns on every run. The `permission-*` inputs narrow
+      # the minted token to what this job actually does, independently of whatever the
+      # App itself is granted — but the App must be granted at least as much, because
+      # requesting a permission the installation lacks fails the mint outright. The
+      # App therefore needs Contents RW, Pull requests RW, Issues RW, Workflows RW and
+      # Metadata R. Workflows is for the `github-actions` ecosystem: without it, a
+      # bump touching `.github/workflows/` cannot be merged.
+      - name: Mint a GitHub App installation token
+        id: app-token
+        # Degrade, do not break. A repo whose stub forwards no App secrets, or that
+        # has not installed the App, keeps auto-merging on GH_TOKEN/github.token and
+        # loses only the downstream-trigger fix. Every step below falls back in the
+        # same order, and the next step makes the degradation loud rather than silent.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ secrets.AUTOMERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-workflows: write
+
+      # `outcome`, not `conclusion`: `continue-on-error` rewrites the conclusion to
+      # success, and only the outcome still records that the step failed.
+      - name: Warn that the App token is unavailable
+        if: steps.app-token.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          message="Could not mint a GitHub App token; falling back to GH_TOKEN/github.token. Auto-merge still works, but the merge commit will not trigger push-triggered workflows (CI, Release Please, security scans). Set AUTOMERGE_APP_CLIENT_ID and AUTOMERGE_APP_PRIVATE_KEY and forward them with 'secrets: inherit'."
+          echo "::warning title=Dependabot auto-merge running degraded::${message}"
+          {
+            echo "### Dependabot auto-merge is running degraded"
+            echo
+            echo "${message}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Resolve Dependabot PR
         id: pr
         uses: actions/github-script@v9
         with:
-          github-token: ${{ secrets.GH_TOKEN || github.token }}
+          github-token: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
           script: |
             const { owner, repo } = context.repo;
             let pull_number = context.payload.pull_request?.number;
@@ -65,7 +162,7 @@ jobs:
 
             if (!pull_number) {
               core.setOutput('skip', 'true');
-              core.setOutput('reason', 'No pull request is associated with this event.');
+              core.info('Skipping: no pull request is associated with this event.');
               return;
             }
 
@@ -79,7 +176,7 @@ jobs:
             const isDependabot = pull.user?.login === 'dependabot[bot]';
             if (!isDependabot || pull.draft || pull.base.ref !== context.payload.repository.default_branch) {
               core.setOutput('skip', 'true');
-              core.setOutput('reason', 'Pull request is not a ready Dependabot PR against the default branch.');
+              core.info(`Skipping #${pull.number}: not a ready Dependabot PR against the default branch.`);
               return;
             }
 
@@ -90,28 +187,84 @@ jobs:
             core.setOutput('has_automerge_label', String(labels.includes('automerge')));
             core.setOutput('has_needs_human_review_label', String(labels.includes('needs-human-review')));
 
+      # Eligibility comes from who wrote the commits, not from who triggered the run.
+      # The calling stubs gate on the PR *author* precisely so this can re-run on
+      # every update: `github.actor` is the maintainer on a human `reopened` or
+      # `synchronize`, which says nothing about the contents — a reopened PR still
+      # holds only Dependabot's commit and stays eligible, while a pushed-to branch
+      # does not. (GitHub only cancels auto-merge itself for pushes by users *without*
+      # write access, so a maintainer's push would otherwise ride in on the arm an
+      # earlier run performed.)
+      #
+      # Runs on the `workflow_run` path too, not just `pull_request_target`. Without
+      # it, a human push followed by a green CI run would re-arm off the stale
+      # `automerge` label alone, which is exactly the fail-open this check prevents.
+      #
+      # Paginated, and fails closed: an unattributed commit has no login and is
+      # treated as not Dependabot's. `set -e` means an API failure fails the step,
+      # which skips the arm step and leaves the cancel step to disarm.
+      - name: Check the head holds only Dependabot commits
+        id: provenance
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          authors=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --paginate --jq '.[].author.login // "unattributed"' | sort -u | paste -sd, -)
+          echo "Commit authors on this PR: ${authors}"
+          if [ "${authors}" = "dependabot[bot]" ]; then
+            echo "dependabot-only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependabot-only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Reads the bump out of the head commit message, so it is only meaningful once
+      # the head is known to be Dependabot's. Only available on `pull_request` events,
+      # which is why the `workflow_run` retry path falls back to the labels this run
+      # applies.
       - name: Fetch Dependabot metadata
-        if: ${{ steps.pr.outputs.skip != 'true' && github.event_name == 'pull_request_target' }}
         id: meta
+        if: >-
+          steps.pr.outputs.skip != 'true' &&
+          github.event_name == 'pull_request_target' &&
+          steps.provenance.outputs.dependabot-only == 'true'
         uses: dependabot/fetch-metadata@v3
         with:
-          github-token: ${{ secrets.GH_TOKEN || github.token }}
+          github-token: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
 
+      # The labels are not decoration: `automerge` is what the `workflow_run` retry
+      # path reads instead of Dependabot metadata, so it must mean exactly what the
+      # arm gate means. It is applied for patch and minor only — matching the gate
+      # below rather than "not major" — so a bump with no reported update type cannot
+      # be labelled auto-mergeable here and then armed by the retry path.
+      #
+      # Best-effort: labelling writes through the issues API, and in the degraded
+      # fallback path the token may not carry `issues: write`. A missing label is an
+      # auditability loss, not a safety one, so it must not fail the job and strand a
+      # PR that is otherwise fine to merge.
       - name: Label Dependabot PR
-        if: ${{ steps.pr.outputs.skip != 'true' && github.event_name == 'pull_request_target' }}
+        if: steps.pr.outputs.skip != 'true' && github.event_name == 'pull_request_target'
+        continue-on-error: true
         uses: actions/github-script@v9
         env:
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         with:
-          github-token: ${{ secrets.GH_TOKEN || github.token }}
+          github-token: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
           script: |
             const { owner, repo } = context.repo;
-            const issue_number = Number('${{ steps.pr.outputs.number }}');
+            const issue_number = Number(process.env.PR_NUMBER);
+            const updateType = process.env.UPDATE_TYPE;
+            const autoMergeable =
+              updateType === 'version-update:semver-patch' ||
+              updateType === 'version-update:semver-minor';
             const labels = [
               { name: 'dependencies', color: '0366d6', description: 'Dependency update' },
-              process.env.UPDATE_TYPE === 'version-update:semver-major'
-                ? { name: 'needs-human-review', color: 'd73a4a', description: 'Requires human review before merge' }
-                : { name: 'automerge', color: '0e8a16', description: 'Eligible for automatic merge after required checks pass' }
+              autoMergeable
+                ? { name: 'automerge', color: '0e8a16', description: 'Eligible for automatic merge after required checks pass' }
+                : { name: 'needs-human-review', color: 'd73a4a', description: 'Requires human review before merge' }
             ];
 
             for (const label of labels) {
@@ -134,24 +287,57 @@ jobs:
               labels: labels.map((label) => label.name)
             });
 
-      - name: Auto-approve and merge non-major updates
-        if: >-
-          ${{
-            steps.pr.outputs.skip != 'true' &&
-            (
-              (
-                github.event_name == 'pull_request_target' &&
-                steps.meta.outputs.update-type != 'version-update:semver-major'
-              ) ||
-              (
-                github.event_name == 'workflow_run' &&
-                steps.pr.outputs.has_automerge_label == 'true' &&
-                steps.pr.outputs.has_needs_human_review_label != 'true'
-              )
-            )
-          }}
+      # One decision, computed once, used by both the arm and the cancel step. Keeping
+      # them derived from the same output is what stops the two from disagreeing — a
+      # cancel condition written as the textual inverse of the arm condition has to be
+      # re-inverted correctly every time either changes, and on the `workflow_run`
+      # path the arm inputs do not even exist.
+      #
+      # Patch and minor are an allowlist, not "anything but major". An empty update
+      # type — metadata unavailable, or a non-semver ecosystem — is therefore not
+      # auto-merged, where a `!= major` test would have merged it. Majors stay manual
+      # because they are the ones that break builds; for a grouped PR the update type
+      # is the highest bump in the group, so a group containing a major is not armed.
+      - name: Decide whether this head is auto-mergeable
+        id: gate
+        if: steps.pr.outputs.skip != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEPENDABOT_ONLY: ${{ steps.provenance.outputs.dependabot-only }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          HAS_AUTOMERGE: ${{ steps.pr.outputs.has_automerge_label }}
+          HAS_NEEDS_HUMAN_REVIEW: ${{ steps.pr.outputs.has_needs_human_review_label }}
+        run: |
+          set -euo pipefail
+          eligible=false
+          reason=""
+
+          if [ "${DEPENDABOT_ONLY}" != "true" ]; then
+            reason="the head carries commits that are not Dependabot's"
+          elif [ "${EVENT_NAME}" = "pull_request_target" ]; then
+            case "${UPDATE_TYPE}" in
+              version-update:semver-patch|version-update:semver-minor) eligible=true ;;
+              version-update:semver-major) reason="this is a semver-major bump" ;;
+              "") reason="Dependabot reported no update type for this bump" ;;
+              *) reason="update type ${UPDATE_TYPE} is neither patch nor minor" ;;
+            esac
+          elif [ "${HAS_AUTOMERGE}" = "true" ] && [ "${HAS_NEEDS_HUMAN_REVIEW}" != "true" ]; then
+            eligible=true
+          else
+            reason="the PR is not labelled automerge, or is labelled needs-human-review"
+          fi
+
+          echo "eligible=${eligible}" >> "$GITHUB_OUTPUT"
+          if [ "${eligible}" = "true" ]; then
+            echo "This head is auto-mergeable."
+          else
+            echo "Not arming auto-merge: ${reason}."
+          fi
+
+      - name: Approve and arm auto-merge
+        if: steps.gate.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           PR_URL: ${{ steps.pr.outputs.url }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -177,26 +363,74 @@ jobs:
             exit 0
           fi
 
+          # With a queue enabled, enqueueing on `opened`/`synchronize` would jump the
+          # PR into the queue before its own CI has run. Defer to the `workflow_run`
+          # pass, which fires once CI is green.
           if [ "$EVENT_NAME" = "pull_request_target" ] && [ "$queue_enabled" = "true" ]; then
             echo "Merge queue is enabled; deferring enqueue until CI completes."
             exit 0
           fi
 
+          # Best-effort: repos whose rulesets require an approving review need this,
+          # and on the rest it is a no-op. Never a gate — a failure here must not stop
+          # the arm below.
           gh pr review --approve "$PR_URL" 2>/dev/null || true
 
+          # `--match-head-commit` pins the arm to the SHA this run actually validated,
+          # so a run slow enough for the head to move refuses rather than arming
+          # against a commit its provenance check never inspected. With a queue
+          # enabled the merge method is the queue's to choose, so it is not forced.
           if [ "$queue_enabled" = "true" ]; then
             gh pr merge --auto --match-head-commit "$HEAD_SHA" "$PR_URL"
           else
             gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
           fi
 
+      # The inverse case: a human commit landed on the branch, or a rebase turned the
+      # bump into a major. Either way any previously armed auto-merge has to come back
+      # off, or it would merge content this workflow never approved.
+      #
+      # `pull_request_target` only. A `workflow_run` completion carries no new head
+      # information — it reports that CI finished, not that anything changed — so it
+      # has nothing to revoke. Letting it cancel would also make the concurrency group
+      # unsafe in the other direction: a CI completion that cancels an in-flight
+      # `pull_request_target` run would find the `automerge` label not yet applied and
+      # disarm a perfectly good bump. Head changes arrive as `synchronize` or
+      # `reopened`, and those are handled here.
+      - name: Cancel auto-merge on a non-Dependabot commit or a major bump
+        # `!cancelled()` is required: a custom `if:` otherwise carries an implicit
+        # `success() &&`, so a failure in the resolve, provenance or metadata step
+        # would skip this step and leave an armed auto-merge in place — failing open,
+        # which is the opposite of what the provenance check is for.
+        if: >-
+          !cancelled() &&
+          github.event_name == 'pull_request_target' &&
+          steps.pr.outputs.skip != 'true' &&
+          steps.gate.outputs.eligible != 'true'
+        env:
+          PR_URL: ${{ steps.pr.outputs.url || github.event.pull_request.html_url }}
+          # This is the only step that falls back past the App token by design, and it
+          # has to. If the token cannot be minted, every step above is skipped by the
+          # implicit `success()` while this one still runs on `!cancelled()`. With an
+          # empty token `gh` would fail on auth and an already-armed auto-merge would
+          # survive: exactly the fail-open the `!cancelled()` guard exists to prevent.
+          # Disarming does not need to trigger downstream workflows, so GITHUB_TOKEN is
+          # sufficient; arming is the only step that genuinely requires the App token.
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')" = "true" ]; then
+            echo "Auto-merge is armed but this head is not an auto-mergeable Dependabot bump; cancelling."
+            gh pr merge --disable-auto "$PR_URL"
+          else
+            echo "Auto-merge is not armed; nothing to cancel."
+          fi
+
       - name: Leave major updates for review
         if: >-
-          ${{
-            steps.pr.outputs.skip != 'true' &&
-            github.event_name == 'pull_request_target' &&
-            steps.meta.outputs.update-type == 'version-update:semver-major'
-          }}
+          steps.pr.outputs.skip != 'true' &&
+          github.event_name == 'pull_request_target' &&
+          steps.meta.outputs.update-type == 'version-update:semver-major'
         env:
           DEPENDENCIES: ${{ steps.meta.outputs.dependency-names }}
         run: |
