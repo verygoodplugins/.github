@@ -168,6 +168,38 @@ jobs:
             echo "${message}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Disarm before reclassifying, not after. GitHub keeps auto-merge armed when the
+      # pusher has write access — its docs say it is disabled automatically only for
+      # pushes by users *without* write permission — so from the moment a human commit
+      # (or a rebase into a major) lands until this job reaches its cancel step, the
+      # previous head's arm is still live. If the new head's required checks go green
+      # inside that window, GitHub merges it before this run has classified anything.
+      #
+      # Revoking first and re-arming only once the gate passes inverts the window: a PR
+      # is briefly not armed when it should be, which only delays a merge, instead of
+      # briefly armed when it should not be. The cost is an extra pair of timeline
+      # entries per `synchronize`, and a merge that lands a few seconds later.
+      #
+      # Reads the PR straight from the event payload rather than the resolved outputs, so
+      # it runs before anything that could fail and leave the stale arm in place. Failing
+      # here is not fatal: the job continues and the cancel step at the end re-attempts
+      # the disarm under `!cancelled()`. `pull_request_target` only — a `workflow_run`
+      # completion carries no head change to reclassify.
+      - name: Disarm auto-merge before reclassifying this head
+        if: github.event_name == 'pull_request_target'
+        continue-on-error: true
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')" = "true" ]; then
+            echo "Auto-merge is armed from an earlier classification; disarming before re-evaluating this head."
+            gh pr merge --disable-auto "$PR_URL"
+          else
+            echo "Auto-merge is not armed; nothing to disarm."
+          fi
+
       - name: Resolve Dependabot PR
         id: pr
         uses: actions/github-script@v9
@@ -522,9 +554,13 @@ jobs:
             gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
           fi
 
-      # The inverse case: a human commit landed on the branch, or a rebase turned the
-      # bump into a major. Either way any previously armed auto-merge has to come back
-      # off, or it would merge content this workflow never approved.
+      # The backstop for the disarm above. In the normal path that step has already
+      # revoked the arm and this one reports nothing to cancel; it still exists because
+      # it is the one that runs under `!cancelled()` when the classification path failed,
+      # and because the disarm is best-effort, so this is where a failed disarm gets a
+      # second attempt. A human commit landed on the branch, or a rebase turned the bump
+      # into a major: either way any armed auto-merge has to come back off, or it would
+      # merge content this workflow never approved.
       #
       # `pull_request_target` only. A `workflow_run` completion carries no new head
       # information — it reports that CI finished, not that anything changed — so it
