@@ -290,6 +290,10 @@ jobs:
       # below rather than "not major" — so a bump with no reported update type cannot
       # be labelled auto-mergeable here and then armed by the retry path.
       #
+      # These two labels are classifier-owned: this step rewrites them on every
+      # classification. A human hold belongs on `do-not-merge`, which this workflow
+      # never writes or removes, and which the gate below honours on both paths.
+      #
       # `automerge` and `needs-human-review` are mutually exclusive, so the obsolete
       # one is removed rather than left behind. Without that, a PR that took a human
       # commit (labelled `needs-human-review`, since metadata is skipped) and was then
@@ -376,8 +380,13 @@ jobs:
       # `addLabels` on an already-present label emits no new timeline event, so a patch
       # bump that is rebased and stays a patch bump would look unclassified forever.
       #
-      # `needs-human-review` is still honoured, as a manual override — a human can add it
-      # to hold a PR the classifier was happy with.
+      # A human hold is `do-not-merge`, not `needs-human-review`. The classifier owns
+      # `automerge` and `needs-human-review` and rewrites them on every classification,
+      # so a hold placed with `needs-human-review` would survive only until the next
+      # rebase or reopen reclassified the PR and removed it. `do-not-merge` is never
+      # written or removed by this workflow, and is checked on both paths — so adding it
+      # refuses the arm and, on `pull_request_target`, makes the cancel step below
+      # disarm anything already armed.
       #
       # Waiting rather than refusing keeps the merge-queue path live, since no further
       # `workflow_run` event would arrive to retry after classification lands.
@@ -396,7 +405,16 @@ jobs:
           eligible=false
           reason=""
 
-          if [ "${DEPENDABOT_ONLY}" != "true" ]; then
+          labels=",$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" --jq '[.[].name] | join(",")'),"
+
+          case "${labels}" in
+            *,do-not-merge,*) held=true ;;
+            *) held=false ;;
+          esac
+
+          if [ "${held}" = "true" ]; then
+            reason="the PR is labelled do-not-merge"
+          elif [ "${DEPENDABOT_ONLY}" != "true" ]; then
             reason="the head carries commits that are not Dependabot's"
           elif [ "${EVENT_NAME}" = "pull_request_target" ]; then
             case "${UPDATE_TYPE}" in
@@ -412,10 +430,15 @@ jobs:
               marked="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" \
                 --jq '[.[] | select(.context == "dependabot-auto-merge/eligible" and .state == "success")] | length')"
               if [ "${marked}" != "0" ]; then
+                # Re-read, because a hold may have been applied during the wait. Only
+                # `do-not-merge` is consulted: the marker is the classifier's verdict for
+                # this exact head, so re-checking `needs-human-review` here would make
+                # arming depend on label state again — and a stale one left behind by a
+                # failed best-effort relabel would strand a PR that is fine to merge.
                 labels=",$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" --jq '[.[].name] | join(",")'),"
                 echo "Head ${HEAD_SHA} is marked eligible; labels ${labels}"
                 case "${labels}" in
-                  *,needs-human-review,*) reason="the PR is labelled needs-human-review" ;;
+                  *,do-not-merge,*) reason="the PR is labelled do-not-merge" ;;
                   *) eligible=true ;;
                 esac
                 break
