@@ -144,17 +144,29 @@ jobs:
 
       # GitHub does not start new workflow runs from events caused by GITHUB_TOKEN,
       # and that extends to the merge an auto-merge it armed performs. Measured on
-      # verygoodplugins/mcp-automem: the three auto-merged bumps 5775c95, 07db972 and
-      # 9ed9084 each produced 0 runs for `event=push`, while the human merges on
-      # either side (d2a2660, 06f6fb1) each produced 4 — CI, Release Please, Docs
-      # Dispatch and Security. So auto-merged bumps silently skipped the release PR
-      # update, the push-to-main CI run that is the only thing testing bumps in
-      # combination, and the scheduled security scans:
+      # verygoodplugins/mcp-automem, where the swap has since shipped and run:
+      #
+      #   5775c95, 07db972, 9ed9084   auto-merged under GITHUB_TOKEN   0 push runs
+      #   72bc31e, 7b45e959           merged with the App token        3 push runs
+      #   d2a2660, 06f6fb1            merged by a human                4 push runs
+      #
+      # So auto-merged bumps silently skipped the release PR update, the push-to-main
+      # CI run that is the only thing testing bumps in combination, and the scheduled
+      # security scans. 7b45e959 is the proof the fix works: an auto-merge armed by the
+      # App, merged by `vgp-dependabot-auto-merge[bot]`, where identical GITHUB_TOKEN
+      # auto-merges had produced nothing.
       #
       #   gh api "repos/OWNER/REPO/actions/runs?head_sha=SHA&event=push" --jq '.total_count'
       #
-      # Filter on `event=push`. A bare total is misleading: 5775c95 reports 2 runs,
-      # both Dependabot's own `event=dynamic` runs attached to main's head.
+      # Two traps when checking this. Filter on `event=push` — a bare total is
+      # misleading, since 5775c95 reports 2 runs, both Dependabot's own `event=dynamic`
+      # runs attached to main's head. And compare against 0, not against a count: the
+      # number of push-triggered workflows is per-repo, and even within one repo it
+      # varies. The 4 above is not the baseline — mcp-automem has three workflows on
+      # `push: branches: [main]` (CI, Release Please, Security), and those two human
+      # merges each also cut a release, which pulls in Docs Dispatch as an inherited
+      # `event=push` run via a gated `workflow_call` from release-please. An ordinary
+      # bump there shows 3, and 3 is not a failure.
       #
       # A GitHub App installation token is not GITHUB_TOKEN, so merges it performs do
       # start those runs. The same swap is what a merge queue would need —
