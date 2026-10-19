@@ -72,7 +72,7 @@ jobs:
         )
       }}
     runs-on: ubuntu-latest
-    # One run at a time per PR, newest wins. Without this, two overlapping
+    # One run at a time per PR per event, newest wins. Without this, two overlapping
     # `synchronize` runs can interleave: the older one validates a Dependabot-only
     # head, the newer one cancels auto-merge after a human push, and then the older
     # one re-arms against the head it never saw. A cancelled run stops at the
@@ -209,19 +209,31 @@ jobs:
       # it, a human push followed by a green CI run would re-arm off the stale
       # `automerge` label alone, which is exactly the fail-open this check prevents.
       #
-      # Checks author *and* committer, because the author alone is not proof of
-      # origin: an amend or cherry-pick keeps the original author while the person who
-      # rewrote it becomes the committer, so an author-only test would let a
-      # maintainer edit a Dependabot commit in place and still pass. Dependabot's own
-      # commits are created through the API and signed by GitHub, so they come back as
-      # `author=dependabot[bot]`, `committer=web-flow` with a valid signature —
-      # verified across mcp-toggl #148, mcp-automem #247 and mcp-pirsch #75. A locally
-      # amended commit has the maintainer as committer, or no login at all.
+      # Checks author, committer *and* GitHub's signature, because neither login is
+      # proof of origin on its own.
       #
-      # An allowlist of pairs, so anything unexpected fails closed rather than being
-      # waved through: an unattributed commit has no login, and `set -e` means an API
-      # failure fails the step, which skips the arm step and leaves the cancel step to
-      # disarm.
+      # The author alone is not: an amend or cherry-pick keeps the original author
+      # while whoever rewrote it becomes the committer, so an author-only test would
+      # let a maintainer edit a Dependabot commit in place and still pass.
+      #
+      # The committer alone is not either, and this is the subtle one: GitHub resolves
+      # `committer.login` from the committer *email*, exactly as it does the author's.
+      # `web-flow` is simply the account that owns `noreply@github.com`, so anyone with
+      # push access can set `GIT_COMMITTER_EMAIL` to it and have the pair come back as
+      # `dependabot[bot]/web-flow`. The signature is the part that cannot be forged:
+      # Dependabot's commits are created through the API and signed with GitHub's own
+      # key, and a maintainer signing under that email with their own key fails
+      # verification because the address is not a verified email on their account.
+      #
+      # Observed on real data: `author=dependabot[bot]`, `committer=web-flow`,
+      # `verification.verified=true`, `reason=valid`, identically on mcp-toggl #148,
+      # mcp-automem #247 and mcp-pirsch #75; human commits on a Dependabot branch
+      # (mcp-automem #242) come back `author=committer=jack-arturo`, `verified=false`.
+      #
+      # An allowlist of triples, so anything unexpected fails closed rather than being
+      # waved through: an unattributed commit has no login, an unsigned one is not
+      # `true`, and `set -e` means an API failure fails the step, which skips the arm
+      # step and leaves the cancel step to disarm.
       - name: Check the head holds only Dependabot commits
         id: provenance
         if: steps.pr.outputs.skip != 'true'
@@ -230,18 +242,18 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
-          pairs="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
-            --paginate --jq '.[] | "\(.author.login // "unattributed")/\(.committer.login // "unattributed")"' | sort -u)"
-          echo "Commit author/committer pairs on this PR:"
-          printf '  %s\n' "${pairs}"
+          triples="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --paginate --jq '.[] | "\(.author.login // "unattributed")/\(.committer.login // "unattributed")/\(.commit.verification.verified)"' | sort -u)"
+          echo "Commit author/committer/verified triples on this PR:"
+          printf '  %s\n' "${triples}"
 
           dependabot_only=true
-          while IFS= read -r pair; do
-            case "${pair}" in
-              'dependabot[bot]/dependabot[bot]'|'dependabot[bot]/web-flow') ;;
+          while IFS= read -r triple; do
+            case "${triple}" in
+              'dependabot[bot]/dependabot[bot]/true'|'dependabot[bot]/web-flow/true') ;;
               *) dependabot_only=false ;;
             esac
-          done <<<"${pairs}"
+          done <<<"${triples}"
 
           echo "dependabot-only=${dependabot_only}" >> "$GITHUB_OUTPUT"
 
@@ -433,11 +445,8 @@ jobs:
       #
       # `pull_request_target` only. A `workflow_run` completion carries no new head
       # information — it reports that CI finished, not that anything changed — so it
-      # has nothing to revoke. Letting it cancel would also make the concurrency group
-      # unsafe in the other direction: a CI completion that cancels an in-flight
-      # `pull_request_target` run would find the `automerge` label not yet applied and
-      # disarm a perfectly good bump. Head changes arrive as `synchronize` or
-      # `reopened`, and those are handled here.
+      # has nothing to revoke. Head changes arrive as `synchronize` or `reopened`, and
+      # those are handled here.
       - name: Cancel auto-merge on a non-Dependabot commit or a major bump
         # `!cancelled()` is required: a custom `if:` otherwise carries an implicit
         # `success() &&`, so a failure in the resolve, provenance or metadata step
