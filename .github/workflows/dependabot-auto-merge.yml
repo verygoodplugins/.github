@@ -83,10 +83,19 @@ jobs:
     # `workflow_run` payloads carry no `pull_request` object, and their
     # `pull_requests` array is often empty, so the group falls through to `run_id`
     # and simply does not dedupe rather than lumping unrelated runs together.
+    #
+    # Scoped per event, not just per PR. The property this exists for is specific to
+    # `pull_request_target`: two overlapping `synchronize` runs must not interleave.
+    # Sharing one group with the `workflow_run` pass would let a CI completion cancel
+    # the classification run that fetches metadata and writes the labels — and since
+    # the retry pass reads those labels instead of re-deriving metadata, the PR would
+    # be left unarmed, permanently so in a merge-queue repo where the
+    # `pull_request_target` path defers enqueueing to the retry.
+    #
+    # Kept on one line on purpose: a folded block scalar preserves the newlines of
+    # more-indented continuation lines, which would leave them inside the `${{ }}`.
     concurrency:
-      # Kept on one line on purpose: a folded block scalar preserves the newlines of
-      # more-indented continuation lines, which would leave them inside the `${{ }}`.
-      group: dependabot-auto-merge-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
+      group: dependabot-auto-merge-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
       cancel-in-progress: true
     steps:
       # GitHub does not start new workflow runs from events caused by GITHUB_TOKEN,
@@ -200,9 +209,19 @@ jobs:
       # it, a human push followed by a green CI run would re-arm off the stale
       # `automerge` label alone, which is exactly the fail-open this check prevents.
       #
-      # Paginated, and fails closed: an unattributed commit has no login and is
-      # treated as not Dependabot's. `set -e` means an API failure fails the step,
-      # which skips the arm step and leaves the cancel step to disarm.
+      # Checks author *and* committer, because the author alone is not proof of
+      # origin: an amend or cherry-pick keeps the original author while the person who
+      # rewrote it becomes the committer, so an author-only test would let a
+      # maintainer edit a Dependabot commit in place and still pass. Dependabot's own
+      # commits are created through the API and signed by GitHub, so they come back as
+      # `author=dependabot[bot]`, `committer=web-flow` with a valid signature —
+      # verified across mcp-toggl #148, mcp-automem #247 and mcp-pirsch #75. A locally
+      # amended commit has the maintainer as committer, or no login at all.
+      #
+      # An allowlist of pairs, so anything unexpected fails closed rather than being
+      # waved through: an unattributed commit has no login, and `set -e` means an API
+      # failure fails the step, which skips the arm step and leaves the cancel step to
+      # disarm.
       - name: Check the head holds only Dependabot commits
         id: provenance
         if: steps.pr.outputs.skip != 'true'
@@ -211,14 +230,20 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
-          authors=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
-            --paginate --jq '.[].author.login // "unattributed"' | sort -u | paste -sd, -)
-          echo "Commit authors on this PR: ${authors}"
-          if [ "${authors}" = "dependabot[bot]" ]; then
-            echo "dependabot-only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "dependabot-only=false" >> "$GITHUB_OUTPUT"
-          fi
+          pairs="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --paginate --jq '.[] | "\(.author.login // "unattributed")/\(.committer.login // "unattributed")"' | sort -u)"
+          echo "Commit author/committer pairs on this PR:"
+          printf '  %s\n' "${pairs}"
+
+          dependabot_only=true
+          while IFS= read -r pair; do
+            case "${pair}" in
+              'dependabot[bot]/dependabot[bot]'|'dependabot[bot]/web-flow') ;;
+              *) dependabot_only=false ;;
+            esac
+          done <<<"${pairs}"
+
+          echo "dependabot-only=${dependabot_only}" >> "$GITHUB_OUTPUT"
 
       # Reads the bump out of the head commit message, so it is only meaningful once
       # the head is known to be Dependabot's. Only available on `pull_request` events,
@@ -240,6 +265,13 @@ jobs:
       # below rather than "not major" — so a bump with no reported update type cannot
       # be labelled auto-mergeable here and then armed by the retry path.
       #
+      # `automerge` and `needs-human-review` are mutually exclusive, so the obsolete
+      # one is removed rather than left behind. Without that, a PR that took a human
+      # commit (labelled `needs-human-review`, since metadata is skipped) and was then
+      # force-updated by Dependabot back to a bot-only patch head would carry both
+      # labels at once — and the retry pass rejects a PR labelled
+      # `needs-human-review`, so a merge-queue repo would never recover.
+      #
       # Best-effort: labelling writes through the issues API, and in the degraded
       # fallback path the token may not carry `issues: write`. A missing label is an
       # auditability loss, not a safety one, so it must not fail the job and strand a
@@ -260,12 +292,13 @@ jobs:
             const autoMergeable =
               updateType === 'version-update:semver-patch' ||
               updateType === 'version-update:semver-minor';
+            const automerge = { name: 'automerge', color: '0e8a16', description: 'Eligible for automatic merge after required checks pass' };
+            const needsHumanReview = { name: 'needs-human-review', color: 'd73a4a', description: 'Requires human review before merge' };
             const labels = [
               { name: 'dependencies', color: '0366d6', description: 'Dependency update' },
-              autoMergeable
-                ? { name: 'automerge', color: '0e8a16', description: 'Eligible for automatic merge after required checks pass' }
-                : { name: 'needs-human-review', color: 'd73a4a', description: 'Requires human review before merge' }
+              autoMergeable ? automerge : needsHumanReview
             ];
+            const obsolete = autoMergeable ? needsHumanReview.name : automerge.name;
 
             for (const label of labels) {
               try {
@@ -286,6 +319,14 @@ jobs:
               issue_number,
               labels: labels.map((label) => label.name)
             });
+
+            try {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: obsolete });
+              core.info(`Removed the now-obsolete ${obsolete} label.`);
+            } catch (error) {
+              // 404 just means it was not applied in the first place.
+              if (error.status !== 404) throw error;
+            }
 
       # One decision, computed once, used by both the arm and the cancel step. Keeping
       # them derived from the same output is what stops the two from disagreeing — a
