@@ -130,7 +130,7 @@ jobs:
       # App itself is granted — but the App must be granted at least as much, because
       # requesting a permission the installation lacks fails the mint outright. The
       # App therefore needs Contents RW, Pull requests RW, Issues RW, Workflows RW,
-      # Merge queues RW and Metadata R. Workflows is for the `github-actions`
+      # Merge queues RW, Commit statuses RW and Metadata R. Workflows is for the `github-actions`
       # ecosystem: without it, a bump touching `.github/workflows/` cannot be merged.
       # Merge queues is for the enqueue path below: no consumer has a queue enabled
       # today, but granting it up front means turning one on is a ruleset change rather
@@ -152,6 +152,7 @@ jobs:
           permission-issues: write
           permission-workflows: write
           permission-merge-queues: write
+          permission-statuses: write
 
       # `outcome`, not `conclusion`: `continue-on-error` rewrites the conclusion to
       # success, and only the outcome still records that the step failed.
@@ -365,16 +366,21 @@ jobs:
       # is the highest bump in the group, so a group containing a major is not armed.
       #
       # The `workflow_run` pass is the one path that cannot call `fetch-metadata`, so it
-      # has to read the classification the `pull_request_target` pass recorded as
-      # labels. Labels are mutable and not bound to a commit, so they are trusted only
-      # once they are known to describe *this* head: the newest `automerge` or
-      # `needs-human-review` labelling must be at least as recent as the head commit.
-      # Without that, a head that changed from a patch bump to a major could be merged
-      # off the previous head's `automerge` label whenever CI finished before
-      # classification had relabelled — the event-scoped concurrency groups stop the two
-      # runs cancelling each other, but they do not order the label write before the
-      # read. Waiting rather than refusing keeps the merge-queue path live, since no
-      # further `workflow_run` event would arrive to retry after classification lands.
+      # reads the classification marker the `pull_request_target` pass writes on the head
+      # commit. It deliberately does not read the labels for that: labels are mutable and
+      # not bound to a commit, so a head that changed from a patch bump to a major could
+      # be merged off the previous head's `automerge` label whenever CI finished before
+      # classification had relabelled. The event-scoped concurrency groups stop the two
+      # runs cancelling each other, but they do not order the classification write before
+      # this read. Nor is "has the label been re-applied recently" a usable substitute:
+      # `addLabels` on an already-present label emits no new timeline event, so a patch
+      # bump that is rebased and stays a patch bump would look unclassified forever.
+      #
+      # `needs-human-review` is still honoured, as a manual override — a human can add it
+      # to hold a PR the classifier was happy with.
+      #
+      # Waiting rather than refusing keeps the merge-queue path live, since no further
+      # `workflow_run` event would arrive to retry after classification lands.
       - name: Decide whether this head is auto-mergeable
         id: gate
         if: steps.pr.outputs.skip != 'true'
@@ -390,11 +396,6 @@ jobs:
           eligible=false
           reason=""
 
-          classified_at() {
-            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/timeline" --paginate \
-              --jq '[.[] | select(.event == "labeled" and (.label.name == "automerge" or .label.name == "needs-human-review"))] | last | .created_at // ""'
-          }
-
           if [ "${DEPENDABOT_ONLY}" != "true" ]; then
             reason="the head carries commits that are not Dependabot's"
           elif [ "${EVENT_NAME}" = "pull_request_target" ]; then
@@ -405,23 +406,21 @@ jobs:
               *) reason="update type ${UPDATE_TYPE} is neither patch nor minor" ;;
             esac
           else
-            head_at="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}" --jq '.commit.committer.date')"
-            head_epoch="$(date -u -d "${head_at}" +%s)"
-            reason="classification has not labelled this head (${HEAD_SHA}) yet"
+            reason="classification has not marked this head (${HEAD_SHA}) eligible"
 
             for attempt in $(seq 1 12); do
-              label_at="$(classified_at)"
-              if [ -n "${label_at}" ] && [ "$(date -u -d "${label_at}" +%s)" -ge "${head_epoch}" ]; then
+              marked="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" \
+                --jq '[.[] | select(.context == "dependabot-auto-merge/eligible" and .state == "success")] | length')"
+              if [ "${marked}" != "0" ]; then
                 labels=",$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" --jq '[.[].name] | join(",")'),"
-                echo "Head committed ${head_at}; classified ${label_at}; labels ${labels}"
+                echo "Head ${HEAD_SHA} is marked eligible; labels ${labels}"
                 case "${labels}" in
                   *,needs-human-review,*) reason="the PR is labelled needs-human-review" ;;
-                  *,automerge,*) eligible=true ;;
-                  *) reason="neither eligibility label is present" ;;
+                  *) eligible=true ;;
                 esac
                 break
               fi
-              echo "Head committed ${head_at}; newest classification ${label_at:-none} — waiting (attempt ${attempt}/12)"
+              echo "No eligibility marker on ${HEAD_SHA} yet — waiting (attempt ${attempt}/12)"
               sleep 5
             done
           fi
@@ -432,6 +431,30 @@ jobs:
           else
             echo "Not arming auto-merge: ${reason}."
           fi
+
+      # The marker the retry pass above reads. Written on every classification, whether
+      # or not the verdict changed, which is what labels cannot do. A commit status is
+      # inherently bound to the SHA, so there is no window in which it describes a
+      # different head.
+      #
+      # Only ever posted as `success`, and only when eligible — so it cannot appear as a
+      # red check, and a repo that mistakenly makes the context required would hold
+      # non-eligible PRs rather than merging them. Best-effort: in the degraded fallback
+      # path the token has no `statuses: write`, and losing the marker must not fail a
+      # job that is otherwise free to arm.
+      - name: Record the classification on the head commit
+        if: github.event_name == 'pull_request_target' && steps.gate.outputs.eligible == 'true'
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GH_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=success \
+            -f context='dependabot-auto-merge/eligible' \
+            -f description='Dependabot-only head, patch or minor bump' >/dev/null
+          echo "Recorded dependabot-auto-merge/eligible on ${HEAD_SHA}."
 
       - name: Approve and arm auto-merge
         if: steps.gate.outputs.eligible == 'true'
